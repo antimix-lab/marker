@@ -1,6 +1,6 @@
 [project]
 name = "marker-pdf"
-version = "2.0.0"
+version = "2.0.0+antimix.1"
 description = "Convert documents to markdown with high speed and accuracy."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -34,9 +34,12 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/datalab-to/marker"
+Repository = "https://github.com/antimix-lab/marker"
 
 [project.optional-dependencies]
+desktop = [
+    "PySide6>=6.11,<7",
+]
 full = [
     "mammoth>=1.9.0,<2",
     "openpyxl>=3.1.5,<4",
@@ -50,6 +53,7 @@ marker = "marker.scripts.convert:convert_cli"
 marker_single = "marker.scripts.convert_single:convert_single_cli"
 marker_gui = "marker.scripts.run_streamlit_app:streamlit_app_cli"
 marker_server = "marker.scripts.server:server_cli"
+marker_antimix_gui = "antimix_gui.marker_gui:main"
 
 [dependency-groups]
 dev = [
@@ -76,4 +80,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["marker"]
+packages = ["marker", "antimix_gui"]

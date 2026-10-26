@@ -46,6 +46,19 @@ def _garble_ok(lines) -> bool:
     return len(_PUA.findall(text)) / len(text) <= _GARBLE_CHAR_FRAC
 
 
+def _coalesce_same_baseline(lines):
+    """Merge cells emitted by pdftext as separate lines at the same y."""
+    merged = []
+    for spans, y0, y1 in sorted(lines, key=lambda item: (item[1], item[2])):
+        if merged and abs(merged[-1][1] - y0) <= 1.5:
+            merged[-1][0].extend(spans)
+            merged[-1][0].sort(key=lambda span: span[1])
+            merged[-1][2] = max(merged[-1][2], y1)
+        else:
+            merged.append([list(spans), y0, y1])
+    return [(spans, y0, y1) for spans, y0, y1 in merged]
+
+
 # --------------------------------------------------------------------------- #
 # header band split
 # --------------------------------------------------------------------------- #
@@ -326,6 +339,314 @@ def _build_html(names, grid, has_header: bool) -> str:
     return "".join(out)
 
 
+def infer_table_column_cuts(lines, column_count):
+    """Infer cuts from repeated content starts and the real inter-column gaps."""
+    if column_count < 2:
+        return None
+    spans = [span for row, _y0, _y1 in lines for span in row]
+    starts = sorted({round(x0, 1) for _text, x0, _x1 in spans})
+    if len(starts) < column_count:
+        return None
+    same_line_pairs = set()
+    for row, _y0, _y1 in lines:
+        row_starts = sorted({round(x0, 1) for _text, x0, _x1 in row})
+        same_line_pairs.update(itertools.pairwise(row_starts))
+    candidates = []
+    for split_at in itertools.combinations(range(len(starts) - 1), column_count - 1):
+        boundaries = [(starts[i] + starts[i + 1]) / 2 for i in split_at]
+        groups = [[] for _ in range(column_count)]
+        for span in spans:
+            groups[sum(span[1] >= boundary for boundary in boundaries)].append(span)
+        crossed = sum((starts[i], starts[i + 1]) in same_line_pairs for i in split_at)
+        score = (min(map(len, groups)), len(groups[0]), -crossed, sum(starts[i + 1] - starts[i] for i in split_at))
+        candidates.append((score, split_at))
+    if not candidates:
+        return None
+    _score, split_at = max(candidates)
+    groups = []
+    begin = 0
+    for end in list(split_at) + [len(starts) - 1]:
+        groups.append(starts[begin : end + 1])
+        begin = end + 1
+    start_boundaries = [(starts[i] + starts[i + 1]) / 2 for i in split_at]
+    groups = [[] for _group in groups]
+    for text, x0, x1 in spans:
+        group = sum(x0 >= boundary for boundary in start_boundaries)
+        groups[group].append((text, x0, x1))
+    cuts = []
+    for left, right in itertools.pairwise(groups):
+        if not left or not right:
+            return None
+        left_edge = max(x1 for _text, _x0, x1 in left)
+        right_edge = min(x0 for _text, x0, _x1 in right)
+        if right_edge <= left_edge:
+            return None
+        cuts.append((left_edge + right_edge) / 2)
+    return cuts
+
+
+def reconstruct_continued_table_html(
+    lines, names, cut_xs, pdftext_page=None, table_bbox=None
+):
+    """Reconstruct a headerless table continued from the preceding page."""
+    lines = _coalesce_same_baseline(lines)
+    k = len(cut_xs) + 1
+    if len(names) != k or not lines:
+        return None
+
+    physical = []
+    for spans, y0, y1 in lines:
+        cells = [""] * k
+        for text, x0, x1 in spans:
+            center = (x0 + x1) / 2
+            column = min(sum(center >= cut for cut in cut_xs), k - 1)
+            cells[column] = f"{cells[column]} {text}".strip()
+        physical.append([y0, y1, cells])
+    line_height = median(max(1.0, y1 - y0) for y0, y1, _cells in physical)
+
+    best_anchor = None
+    for column in range(k):
+        occupied = [(y0, y1) for y0, y1, cells in physical if cells[column]]
+        if len(occupied) < 2:
+            continue
+        clusters = []
+        for y0, y1 in occupied:
+            if clusters and y0 - clusters[-1][-1][1] <= 0.4 * line_height:
+                clusters[-1].append((y0, y1))
+            else:
+                clusters.append([(y0, y1)])
+        if len(clusters) < 2:
+            continue
+        candidate = (len(occupied), column, clusters)
+        if best_anchor is None or candidate[:2] < best_anchor[:2]:
+            best_anchor = candidate
+    if best_anchor is None:
+        return None
+
+    _occupied, _column, clusters = best_anchor
+    anchors = [
+        (cluster[0][0] + cluster[-1][1]) / 2 for cluster in clusters
+    ]
+    spacings = [right - left for left, right in itertools.pairwise(anchors)]
+    if not spacings:
+        return None
+    first_boundary = anchors[0] - median(spacings) / 2
+    boundaries = [
+        (left + right) / 2 for left, right in itertools.pairwise(anchors)
+    ]
+    orphan = [""] * k
+    grid = [[""] * k for _anchor in anchors]
+
+    def add_cells(y0, y1, cells):
+        center = (y0 + y1) / 2
+        if center < first_boundary:
+            target = orphan
+        else:
+            row = sum(center >= boundary for boundary in boundaries)
+            target = grid[row]
+        for column, text in enumerate(cells):
+            if text:
+                target[column] = f"{target[column]} {text}".strip()
+
+    block_groups = []
+    if pdftext_page and table_bbox:
+        bx0, by0, bx1, by1 = table_bbox
+        for pdf_block in pdftext_page.get("blocks", []):
+            grouped_lines = []
+            for line in pdf_block.get("lines", []):
+                tokens = _line_tokens(line, table_bbox)
+                if tokens:
+                    lb = line.get("bbox") or [0, 0, 0, 0]
+                    grouped_lines.append((tokens, lb[1], lb[3]))
+            if grouped_lines:
+                block_groups.append(grouped_lines)
+
+    if block_groups:
+        for grouped_lines in block_groups:
+            mapped = []
+            anchor_tokens = 0
+            for spans, y0, y1 in grouped_lines:
+                cells = [""] * k
+                for text, x0, x1 in spans:
+                    center = (x0 + x1) / 2
+                    column = min(sum(center >= cut for cut in cut_xs), k - 1)
+                    cells[column] = f"{cells[column]} {text}".strip()
+                    if column == _column:
+                        anchor_tokens += 1
+                mapped.append((y0, y1, cells))
+            if anchor_tokens > 1:
+                for y0, y1, cells in mapped:
+                    add_cells(y0, y1, cells)
+            else:
+                cells = [""] * k
+                for _y0, _y1, line_cells in mapped:
+                    for column, text in enumerate(line_cells):
+                        if text:
+                            cells[column] = f"{cells[column]} {text}".strip()
+                add_cells(
+                    min(y0 for y0, _y1, _cells in mapped),
+                    max(y1 for _y0, y1, _cells in mapped),
+                    cells,
+                )
+    else:
+        for y0, y1, cells in physical:
+            add_cells(y0, y1, cells)
+
+    # A fragment above the first row-anchor which occupies no first column is
+    # the tail of the preceding page's last row, not a prefix of this page's
+    # first row.  Return it to the caller so it can be appended upstream.
+    upstream_orphan = orphan if not orphan[0] and any(orphan[1:]) else None
+    if any(orphan) and upstream_orphan is None:
+        grid.insert(0, orphan)
+    complete = sum(sum(bool(cell) for cell in row) >= 2 for row in grid)
+    if complete < max(2, len(grid) - 1):
+        return None
+    return _build_html(names, grid, True), 0.95, upstream_orphan
+
+
+def reconstruct_headerless_table_html(lines):
+    """Recover a continuation table when its preceding page is not loaded."""
+    lines = _coalesce_same_baseline(lines)
+    if not lines:
+        return None
+    best = None
+    for column_count in range(2, 7):
+        cuts = infer_table_column_cuts(lines, column_count)
+        if not cuts:
+            continue
+        physical = []
+        for spans, y0, y1 in lines:
+            cells = [""] * column_count
+            for text, x0, x1 in spans:
+                col = min(sum((x0 + x1) / 2 >= cut for cut in cuts), column_count - 1)
+                cells[col] = f"{cells[col]} {text}".strip()
+            physical.append((y0, y1, cells))
+        line_height = min(max(1.0, y1 - y0) for y0, y1, _cells in physical)
+        column_clusters = []
+        for column in range(column_count):
+            anchors = [(y0, y1) for y0, y1, cells in physical if cells[column]]
+            clusters = []
+            for anchor in anchors:
+                if clusters and anchor[0] - clusters[-1][-1][1] <= line_height:
+                    clusters[-1].append(anchor)
+                else:
+                    clusters.append([anchor])
+            column_clusters.append(clusters)
+        anchor_column, clusters = max(
+            enumerate(column_clusters), key=lambda item: (len(item[1]), -item[0])
+        )
+        if len(clusters) < 2:
+            continue
+        if len(clusters) < 2:
+            continue
+        centers = [(c[0][0] + c[-1][1]) / 2 for c in clusters]
+        boundaries = [(a + b) / 2 for a, b in itertools.pairwise(centers)]
+        grid = [[""] * column_count for _ in centers]
+        for y0, y1, cells in physical:
+            row = sum((y0 + y1) / 2 >= boundary for boundary in boundaries)
+            for col, text in enumerate(cells):
+                if text:
+                    grid[row][col] = f"{grid[row][col]} {text}".strip()
+        filled = sum(sum(bool(cell) for cell in row) >= 2 for row in grid)
+        if filled < max(2, len(grid) - 1):
+            continue
+        html = _build_html([""] * column_count, grid, False)
+        rank = (column_count, filled, len(html))
+        if best is None or rank > best[0]:
+            best = (rank, html, 0.95)
+    if best is None:
+        return None
+    rank, html, score = best
+    empty_head = "<thead><tr>" + "<th></th>" * rank[0] + "</tr></thead>"
+    return html.replace(empty_head, ""), score
+
+
+def _wrapped_text_table(lines):
+    """Reconstruct text-heavy tables whose cells wrap across physical lines.
+
+    A sparse column (often an ID, level, price, or short label) provides the
+    logical row anchors; all physical lines between consecutive anchors are
+    then folded into the corresponding row.  This complements the regular
+    span/projection grids, which require multiple cells on the same baseline.
+    """
+    ordered = sorted(lines, key=lambda item: item[1])
+    header_index = next(
+        (i for i, (spans, _y0, _y1) in enumerate(ordered) if 2 <= len(spans) <= 12),
+        None,
+    )
+    if header_index is None:
+        return None
+    header_spans = ordered[header_index][0]
+    centers = [(x0 + x1) / 2 for _text, x0, x1 in header_spans]
+    if any(right - left < 20 for left, right in itertools.pairwise(centers)):
+        return None
+    cuts = [(left + right) / 2 for left, right in itertools.pairwise(centers)]
+    k = len(header_spans)
+
+    def column_for(x0, x1):
+        center = (x0 + x1) / 2
+        return min(sum(center >= cut for cut in cuts), k - 1)
+
+    # Coalesce pdftext blocks that share a baseline (different table cells are
+    # frequently emitted as independent lines with identical y coordinates).
+    physical = []  # [y0, y1, cells]
+    for spans, y0, y1 in ordered[header_index + 1 :]:
+        cells = [""] * k
+        for text, x0, x1 in spans:
+            column = column_for(x0, x1)
+            cells[column] = f"{cells[column]} {text}".strip()
+        if physical and abs(physical[-1][0] - y0) <= 1.5:
+            physical[-1][1] = max(physical[-1][1], y1)
+            for column, text in enumerate(cells):
+                if text:
+                    physical[-1][2][column] = (
+                        f"{physical[-1][2][column]} {text}".strip()
+                    )
+        else:
+            physical.append([y0, y1, cells])
+    if len(physical) < MIN_TABLE_ROWS:
+        return None
+
+    line_height = median(max(1.0, y1 - y0) for y0, y1, _cells in physical)
+    best_anchor = None
+    for column in range(k):
+        occupied = [(y0, y1) for y0, y1, cells in physical if cells[column]]
+        if len(occupied) < 2:
+            continue
+        clusters = []
+        for y0, y1 in occupied:
+            if clusters and y0 - clusters[-1][-1][1] <= 1.75 * line_height:
+                clusters[-1].append((y0, y1))
+            else:
+                clusters.append([(y0, y1)])
+        if len(clusters) < 2:
+            continue
+        candidate = (len(occupied), column, clusters)
+        if best_anchor is None or candidate[:2] < best_anchor[:2]:
+            best_anchor = candidate
+    if best_anchor is None:
+        return None
+
+    _occupied_count, _anchor_column, clusters = best_anchor
+    boundaries = [
+        (clusters[index][-1][1] + clusters[index + 1][0][0]) / 2
+        for index in range(len(clusters) - 1)
+    ]
+    grid = [[""] * k for _cluster in clusters]
+    for y0, y1, cells in physical:
+        row = sum((y0 + y1) / 2 >= boundary for boundary in boundaries)
+        for column, text in enumerate(cells):
+            if text:
+                grid[row][column] = f"{grid[row][column]} {text}".strip()
+
+    # Reject weak guesses: most logical rows must contain at least two cells.
+    filled_rows = sum(sum(bool(cell) for cell in row) >= 2 for row in grid)
+    if filled_rows / len(grid) < 0.7:
+        return None
+    names = [text for text, _x0, _x1 in header_spans]
+    return _build_html(names, grid, True), 0.9
+
+
 def _line_tokens(line: dict, bbox):
     """Tokenize a pdftext line into (text, x0, x1) cells inside ``bbox``.
 
@@ -352,10 +673,9 @@ def _line_tokens(line: dict, bbox):
             if not inside(cx0, cy0, cx1, cy1):
                 continue
             ch = c.get("char", "")
-            # Split threshold: half the char height. 0.25x mis-split words in
-            # condensed fonts (letter gaps can reach ~0.3x height); real cell
-            # and column gaps sit well above 0.5x.
-            gap = 0.5 * max(cy1 - cy0, 1.0)
+            # A full character height keeps ordinary justified-word gaps in a
+            # single cell while still splitting the much wider column gaps.
+            gap = 1.0 * max(cy1 - cy0, 1.0)
             if cur is None:
                 cur = [ch, cx0, cx1]
             elif cx0 - cur[2] > gap:
@@ -374,6 +694,25 @@ def _line_tokens(line: dict, bbox):
             sx0, sy0, sx1, sy1 = s["bbox"]
             if t and inside(sx0, sy0, sx1, sy1):
                 tokens.append([t, sx0, sx1])
+
+    # pdftext may split adjacent words (or a currency symbol and its value)
+    # into separate spans.  Join only neighbors whose horizontal gap is no
+    # larger than the line height; true table-column gaps are much wider.
+    line_bbox = line.get("bbox") or [0, 0, 0, 0]
+    join_gap = max(float(line_bbox[3] - line_bbox[1]), 1.0)
+    joined = []
+    for text, x0, x1 in sorted(tokens, key=lambda token: token[1]):
+        if joined and x0 - joined[-1][2] <= join_gap:
+            separator = (
+                ""
+                if re.search(r"\d$", joined[-1][0]) and re.match(r"\d", text)
+                else " "
+            )
+            joined[-1][0] = f"{joined[-1][0]}{separator}{text}".strip()
+            joined[-1][2] = max(joined[-1][2], x1)
+        else:
+            joined.append([text, x0, x1])
+    tokens = joined
 
     out = []
     for text, x0, x1 in tokens:
@@ -415,11 +754,29 @@ def reconstruct_table_html(lines):
 
     ``lines``: [(spans, y0, y1)], spans = [(text, x0, x1)] in PDF points.
     """
-    if not lines or not _garble_ok(lines):
+    if not lines:
+        return None
+    lines = _coalesce_same_baseline(lines)
+    # Layout blocks can include the preceding paragraph/list before a real
+    # table.  A wide, multi-column header is a geometry-based table start;
+    # trim only when there are later rows to support it.
+    header_start = None
+    for index, (spans, _y0, _y1) in enumerate(lines):
+        starts = [x0 for _text, x0, _x1 in spans]
+        if len(starts) >= 3 and max(b - a for a, b in itertools.pairwise(sorted(starts))) >= 40:
+            if any(len(row) >= 2 for row, _a, _b in lines[index + 1 :]):
+                header_start = index
+                break
+    if header_start is not None and header_start:
+        lines = lines[header_start:]
+    if not _garble_ok(lines):
         return None
 
     first_data_y = _find_header_band(lines)
     if first_data_y is None:
+        wrapped = _wrapped_text_table(lines)
+        if wrapped:
+            return wrapped
         # No numeric transition to mark the header. Fall back to the first
         # span-rich data row: sparse lines above it are a (possibly multi-line)
         # header band, so their text is captured instead of dropped.
@@ -465,13 +822,38 @@ def reconstruct_table_html(lines):
     if len(grid) < MIN_TABLE_ROWS:
         return None
 
-    if first_data_y is not None:
+    grid_row_ys = []
+    if data:
         grid_y = list(zip(grid, [y0 for _, y0 in data[-len(grid) :]]))
-        _attach_wrapped_lines(lines, first_data_y, grid_y, cut_xs)
+        attachment_start_y = first_data_y if first_data_y is not None else data[0][1]
+        _attach_wrapped_lines(lines, attachment_start_y, grid_y, cut_xs)
+        grid_row_ys = [y0 for _cells, y0 in grid_y]
         grid = [g for g, _ in grid_y]
 
     if not has_header and grid:
         names, grid, has_header = grid[0], grid[1:], True
+        if grid_row_ys:
+            header_y, grid_row_ys = grid_row_ys[0], grid_row_ys[1:]
+            # Fold incomplete rows into a multiline header when their baseline
+            # is closer to the header than to the following, fuller data row.
+            while len(grid) >= 2 and len(grid_row_ys) >= 2:
+                candidate_fill = sum(bool(cell.strip()) for cell in grid[0])
+                next_fill = sum(bool(cell.strip()) for cell in grid[1])
+                header_gap = grid_row_ys[0] - header_y
+                next_gap = grid_row_ys[1] - grid_row_ys[0]
+                if not (
+                    0 < candidate_fill < next_fill
+                    and header_gap > 0
+                    and next_gap > 0
+                    and header_gap <= 0.8 * next_gap
+                ):
+                    break
+                for column, text in enumerate(grid[0]):
+                    if text:
+                        names[column] = f"{names[column]} {text}".strip()
+                header_y = grid_row_ys[0]
+                grid = grid[1:]
+                grid_row_ys = grid_row_ys[1:]
         if len(grid) < 1:
             return None
 
