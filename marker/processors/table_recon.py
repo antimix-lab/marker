@@ -524,26 +524,49 @@ def reconstruct_headerless_table_html(lines):
         line_height = min(max(1.0, y1 - y0) for y0, y1, _cells in physical)
         column_clusters = []
         for column in range(column_count):
-            anchors = [(y0, y1) for y0, y1, cells in physical if cells[column]]
+            anchors = [i for i, (_y0, _y1, cells) in enumerate(physical) if cells[column]]
             clusters = []
-            for anchor in anchors:
-                if clusters and anchor[0] - clusters[-1][-1][1] <= line_height:
-                    clusters[-1].append(anchor)
-                else:
-                    clusters.append([anchor])
+            for index in anchors:
+                y0, _y1, cells = physical[index]
+                if clusters:
+                    previous_index = clusters[-1][-1]
+                    previous_y0, previous_y1, _previous_cells = physical[previous_index]
+                    # A fresh multi-column line is a new logical record even
+                    # when it touches the preceding row's wrapped text.
+                    fresh_record = (
+                        sum(bool(cell) for cell in cells) >= 2
+                        and any(
+                            sum(bool(cell) for cell in physical[i][2]) >= 2
+                            for i in clusters[-1]
+                        )
+                        and y0 - previous_y0 >= 1.5 * line_height
+                    )
+                    if y0 - previous_y1 <= line_height and not fresh_record:
+                        clusters[-1].append(index)
+                        continue
+                clusters.append([index])
             column_clusters.append(clusters)
         anchor_column, clusters = max(
             enumerate(column_clusters), key=lambda item: (len(item[1]), -item[0])
         )
         if len(clusters) < 2:
             continue
-        if len(clusters) < 2:
-            continue
-        centers = [(c[0][0] + c[-1][1]) / 2 for c in clusters]
+        centers = [(physical[c[0]][0] + physical[c[-1]][1]) / 2 for c in clusters]
         boundaries = [(a + b) / 2 for a, b in itertools.pairwise(centers)]
-        grid = [[""] * column_count for _ in centers]
+        grid = [[""] * column_count for _ in clusters]
         for y0, y1, cells in physical:
             row = sum((y0 + y1) / 2 >= boundary for boundary in boundaries)
+            if (
+                anchor_column == 0
+                and row
+                and y0 < boundaries[row - 1]
+                and sum(bool(cell) for cell in cells) == 1
+            ):
+                next_anchor_y0 = physical[clusters[row][0]][0]
+                if 0 <= next_anchor_y0 - y1 <= 0.2 * line_height:
+                    # A lone wrapped line ending immediately before the next
+                    # label is the previous row's tail, not a new row prefix.
+                    row -= 1
             for col, text in enumerate(cells):
                 if text:
                     grid[row][col] = f"{grid[row][col]} {text}".strip()

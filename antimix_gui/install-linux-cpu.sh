@@ -13,7 +13,7 @@ if [[ -e "$target_venv" ]]; then
 fi
 command -v uv >/dev/null || { echo "uv non disponibile" >&2; exit 2; }
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-wheel="$repo_dir/dist/marker_pdf-2.0.0+antimix.1-py3-none-any.whl"
+wheel="$repo_dir/dist/marker_pdf-2.0.0+antimix.2-py3-none-any.whl"
 
 uv build --wheel "$repo_dir"
 test -f "$wheel" || { echo "Wheel mancante: $wheel" >&2; exit 1; }

@@ -7,6 +7,13 @@ The existing PySide6 GUI is included as the `marker_antimix_gui` entry point.
 
 ## Reproducible Linux CPU install
 
+Clone the dedicated release branch, not the fork's `master` branch:
+
+```bash
+git clone --branch antimix-2.0.0 --single-branch https://github.com/antimix-lab/marker.git
+cd marker
+```
+
 From this checkout, run:
 
 ```bash
@@ -37,9 +44,14 @@ environment and cached models for rollback. Do not run the old
 `marker-pdf-gui/install_marker.sh` against this fork: it installs the PyPI
 package and reapplies text patches to `site-packages`.
 
-Known issue from the baseline comparison on
-`ccnl_commercio_terziario_conflavoro.pdf`, pages 82–83: `ICT Trainer` and
-`Network Specialist` can be merged into one row. The old environment and this
-fork produce byte-identical Markdown for this test, so it is a pre-existing
-quality defect, not a packaging regression. Do not claim that the table
-fidelity goal has been achieved until this and other samples are fixed.
+The inherited `uv.lock` is upstream's lock for version 2.0.0, not this fork's
+CPU installation recipe. Do not use `uv sync` for this installation; use the
+script and its separate pinned requirements file above.
+
+The baseline comparison on `ccnl_commercio_terziario_conflavoro.pdf`, pages
+82–83, found an existing bug: `ICT Trainer` and `Network Specialist` merged
+into one row. The second fork revision separates them while preserving the
+five following records. Run `tests/processors/test_antimix_tables.py` with
+`MARKER_CCNL_PDF` pointing to an OCRmyPDF-processed copy to check these
+regressions. More scanned PDFs, tables and images still need validation before
+claiming general fidelity.
